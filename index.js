@@ -512,6 +512,82 @@ app.get('/api/replicacion/estado', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ✅ LOGIN CON GOOGLE
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { google_id, correo, nombre, foto_url } = req.body;
+
+    // Verificar si ya existe el usuario con ese google_id
+    let result = await pool.query(
+      'SELECT * FROM usuarios WHERE google_id = $1', [google_id]
+    );
+
+    if (result.rows.length > 0) {
+      // Usuario ya existe, hacer login
+      const usuario = result.rows[0];
+      const token = jwt.sign({ id: usuario.id }, JWT_SECRET, { expiresIn: '30d' });
+      return res.json({
+        usuario: {
+          id: usuario.id,
+          nombre_usuario: usuario.nombre_usuario,
+          correo: usuario.correo,
+          foto_url: usuario.foto_url,
+        },
+        token
+      });
+    }
+
+    // Verificar si el correo ya existe
+    result = await pool.query(
+      'SELECT * FROM usuarios WHERE correo = $1', [correo]
+    );
+
+    if (result.rows.length > 0) {
+      // Vincular cuenta existente con Google
+      await pool.query(
+        'UPDATE usuarios SET google_id = $1, foto_url = COALESCE(foto_url, $2) WHERE correo = $3',
+        [google_id, foto_url, correo]
+      );
+      const usuario = result.rows[0];
+      const token = jwt.sign({ id: usuario.id }, JWT_SECRET, { expiresIn: '30d' });
+      return res.json({
+        usuario: {
+          id: usuario.id,
+          nombre_usuario: usuario.nombre_usuario,
+          correo: usuario.correo,
+          foto_url: foto_url || usuario.foto_url,
+        },
+        token
+      });
+    }
+
+    // Crear nuevo usuario con Google
+    // Generar username único basado en el nombre
+    let nombreUsuario = nombre.toLowerCase().replace(/\s+/g, '_');
+    const existeUsername = await pool.query(
+      'SELECT id FROM usuarios WHERE nombre_usuario = $1', [nombreUsuario]
+    );
+
+    if (existeUsername.rows.length > 0) {
+      // Agregar número aleatorio si ya existe
+      nombreUsuario = `${nombreUsuario}_${Math.floor(Math.random() * 9000) + 1000}`;
+    }
+
+    const nuevoUsuario = await pool.query(
+      `INSERT INTO usuarios (nombre_usuario, correo, google_id, foto_url, proveedor)
+       VALUES ($1, $2, $3, $4, 'google') RETURNING id, nombre_usuario, correo, foto_url`,
+      [nombreUsuario, correo, google_id, foto_url]
+    );
+
+    const token = jwt.sign({ id: nuevoUsuario.rows[0].id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({
+      usuario: nuevoUsuario.rows[0],
+      token
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(process.env.PORT, () => {
   console.log(`Nodo Guadalupe corriendo en puerto ${process.env.PORT}`);
