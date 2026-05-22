@@ -468,6 +468,36 @@ app.get('/api/replicacion/estado', async (req, res) => {
   }
 });
 
+// ✅ GUIA POR REGIÓN
+app.get('/api/guia/region/:id', async (req, res) => {
+  try {
+    const [tips, recomendaciones, conducta] = await Promise.all([
+      pool.query(`
+        SELECT t.* FROM tips_ecologia t
+        JOIN lugares l ON t.lugar_id = l.id
+        WHERE l.region_id = $1
+      `, [req.params.id]),
+      pool.query(`
+        SELECT r.* FROM recomendaciones r
+        JOIN lugares l ON r.lugar_id = l.id
+        WHERE l.region_id = $1
+      `, [req.params.id]),
+      pool.query(`
+        SELECT c.* FROM codigos_conducta c
+        JOIN lugares l ON c.lugar_id = l.id
+        WHERE l.region_id = $1
+      `, [req.params.id]),
+    ]);
+
+    res.json({
+      tips: tips.rows,
+      recomendaciones: recomendaciones.rows,
+      conducta: conducta.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.listen(process.env.PORT, () => {
   console.log(`Nodo Guadalupe corriendo en puerto ${process.env.PORT}`);
 });
