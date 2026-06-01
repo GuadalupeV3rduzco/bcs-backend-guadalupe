@@ -592,3 +592,17 @@ app.post('/api/auth/google', async (req, res) => {
 app.listen(process.env.PORT, () => {
   console.log(`Nodo Guadalupe corriendo en puerto ${process.env.PORT}`);
 });
+app.get('/api/lugares/:id', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT l.*, r.nombre as region, c.nombre as categoria
+      FROM lugares l
+      JOIN regiones r ON l.region_id = r.id
+      LEFT JOIN categorias c ON l.categoria_id = c.id
+      WHERE l.id = $1
+    `, [req.params.id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
