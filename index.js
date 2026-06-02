@@ -6,6 +6,8 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'bcs_turismo_secret_2026';
+const NODO_NOMBRE = 'Guadalupe';
+const NODO_URL = 'https://bcs-backend-guadalupe-production-3f83.up.railway.app';
 
 const app = express();
 app.use(cors());
@@ -19,12 +21,24 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
-// URLs de los nodos para replicación
 const NODOS_REPLICAS = [
   'https://bcs-backend-juan-production.up.railway.app',
 ];
 
-// Función para replicar datos a otros nodos
+// Guardar en log de replicación
+async function guardarLog(tabla, operacion, datos) {
+  try {
+    await pool.query(
+      `INSERT INTO log_replicacion (tabla, operacion, datos, nodo_origen)
+       VALUES ($1, $2, $3, $4)`,
+      [tabla, operacion, JSON.stringify(datos), NODO_NOMBRE]
+    );
+  } catch (err) {
+    console.warn('Error guardando log:', err.message);
+  }
+}
+
+// Replicar a otros nodos
 async function replicarANodos(endpoint, datos) {
   for (const nodo of NODOS_REPLICAS) {
     try {
@@ -44,9 +58,93 @@ async function replicarANodos(endpoint, datos) {
   }
 }
 
+// Sincronización al arrancar - pedir cambios perdidos
+async function sincronizarAlArrancar() {
+  console.log('Iniciando sincronización post-arranque...');
+  
+  for (const nodo of NODOS_REPLICAS) {
+    try {
+      // Obtener el timestamp del último registro en nuestro log
+      const ultimoLog = await pool.query(
+        `SELECT MAX(creado_en) as ultimo FROM log_replicacion WHERE nodo_origen != $1`,
+        [NODO_NOMBRE]
+      );
+      
+      const desde = ultimoLog.rows[0].ultimo ?? '2024-01-01T00:00:00Z';
+      
+      const response = await fetch(`${nodo}/api/replicacion/sync?desde=${desde}&nodo=${NODO_NOMBRE}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      
+      if (!response.ok) continue;
+      
+      const cambios = await response.json();
+      
+      if (cambios.length === 0) {
+        console.log(`Sin cambios pendientes de ${nodo}`);
+        continue;
+      }
+      
+      console.log(`Aplicando ${cambios.length} cambios de ${nodo}`);
+      
+      for (const cambio of cambios) {
+        await aplicarCambio(cambio);
+      }
+      
+      console.log(`Sincronización completada con ${nodo}`);
+    } catch (err) {
+      console.warn(`No se pudo sincronizar con ${nodo}: ${err.message}`);
+    }
+  }
+}
+
+// Aplicar un cambio del log
+async function aplicarCambio(cambio) {
+  try {
+    if (cambio.tabla === 'resenas') {
+      const d = cambio.datos;
+      await pool.query(
+        `INSERT INTO resenas (lugar_id, usuario_id, titulo, comentario, estrellas)
+         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+        [d.lugar_id, d.usuario_id, d.titulo, d.comentario, d.estrellas]
+      );
+    } else if (cambio.tabla === 'usuarios') {
+      const d = cambio.datos;
+      const existe = await pool.query(
+        'SELECT id FROM usuarios WHERE correo = $1', [d.correo]
+      );
+      if (existe.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash)
+           VALUES ($1, $2, $3)`,
+          [d.nombre_usuario, d.correo, d.contrasena_hash]
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('Error aplicando cambio:', err.message);
+  }
+}
+
 // ✅ Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', nodo: 'Guadalupe', primario: true });
+  res.json({ status: 'ok', nodo: NODO_NOMBRE, primario: true });
+});
+
+// ✅ Endpoint de sincronización - devuelve cambios desde un timestamp
+app.get('/api/replicacion/sync', async (req, res) => {
+  try {
+    const { desde, nodo } = req.query;
+    const result = await pool.query(
+      `SELECT * FROM log_replicacion 
+       WHERE creado_en > $1 AND nodo_origen != $2
+       ORDER BY creado_en ASC`,
+      [desde ?? '2024-01-01', nodo ?? '']
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ✅ REGIONES
@@ -341,6 +439,7 @@ app.post('/api/resenas', async (req, res) => {
     res.json(result.rows[0]);
 
     if (!esReplicacion) {
+      await guardarLog('resenas', 'INSERT', { lugar_id, usuario_id, titulo, comentario, estrellas });
       replicarANodos('/api/resenas', { lugar_id, usuario_id, titulo, comentario, estrellas });
     }
   } catch (err) {
@@ -406,6 +505,7 @@ app.post('/api/auth/registro', async (req, res) => {
     res.json({ usuario, token });
 
     if (!esReplicacion) {
+      await guardarLog('usuarios', 'INSERT', { nombre_usuario, correo, contrasena_hash: hash });
       replicarANodos('/api/auth/registro', { nombre_usuario, correo, contrasena });
     }
   } catch (err) {
@@ -531,9 +631,7 @@ app.post('/api/auth/google', async (req, res) => {
         token
       });
     }
-    result = await pool.query(
-      'SELECT * FROM usuarios WHERE correo = $1', [correo]
-    );
+    result = await pool.query('SELECT * FROM usuarios WHERE correo = $1', [correo]);
     if (result.rows.length > 0) {
       await pool.query(
         'UPDATE usuarios SET google_id = $1, foto_url = COALESCE(foto_url, $2) WHERE correo = $3',
@@ -564,10 +662,7 @@ app.post('/api/auth/google', async (req, res) => {
       [nombreUsuario, correo, google_id, foto_url]
     );
     const token = jwt.sign({ id: nuevoUsuario.rows[0].id }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({
-      usuario: nuevoUsuario.rows[0],
-      token
-    });
+    res.json({ usuario: nuevoUsuario.rows[0], token });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -598,11 +693,14 @@ app.get('/api/replicacion/estado', async (req, res) => {
     }
   }
   res.json({
-    nodo_actual: 'Guadalupe',
+    nodo_actual: NODO_NOMBRE,
+    url: NODO_URL,
     replicas: estados
   });
 });
 
-app.listen(process.env.PORT, () => {
-  console.log(`Nodo Guadalupe corriendo en puerto ${process.env.PORT}`);
+app.listen(process.env.PORT, async () => {
+  console.log(`Nodo ${NODO_NOMBRE} corriendo en puerto ${process.env.PORT}`);
+  // Esperar 5 segundos para que el servidor esté listo antes de sincronizar
+  setTimeout(sincronizarAlArrancar, 5000);
 });
