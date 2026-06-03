@@ -430,21 +430,35 @@ app.get('/api/resenas/lugar/:id', async (req, res) => {
 app.post('/api/resenas', async (req, res) => {
   try {
     const esReplicacion = req.headers['x-replicacion'] === 'true';
-    const { lugar_id, usuario_id, titulo, comentario, estrellas } = req.body;
+    const { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas } = req.body;
     const result = await pool.query(
-      `INSERT INTO resenas (lugar_id, usuario_id, titulo, comentario, estrellas)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [lugar_id, usuario_id, titulo, comentario, estrellas]
+      `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
     );
     res.json(result.rows[0]);
 
     if (!esReplicacion) {
-      await guardarLog('resenas', 'INSERT', { lugar_id, usuario_id, titulo, comentario, estrellas });
-      replicarANodos('/api/resenas', { lugar_id, usuario_id, titulo, comentario, estrellas });
+      await guardarLog('resenas', 'INSERT', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
+      replicarANodos('/api/resenas', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+  app.get('/api/resenas/actividad/:id', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT r.*, u.nombre_usuario, u.foto_url as usuario_foto
+      FROM resenas r
+      LEFT JOIN usuarios u ON r.usuario_id = u.id
+      WHERE r.actividad_id = $1
+      ORDER BY r.creado_en DESC
+    `, [req.params.id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 });
 
 // ✅ GUIA POR REGIÓN
