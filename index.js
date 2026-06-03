@@ -398,11 +398,17 @@ app.post('/api/conducta', async (req, res) => {
 app.get('/api/resenas/region/:id', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT r.*, u.nombre_usuario, u.foto_url as usuario_foto
+      SELECT r.*, u.nombre_usuario, u.foto_url as usuario_foto,
+             l.nombre as lugar_nombre, a.nombre as actividad_nombre
       FROM resenas r
       LEFT JOIN usuarios u ON r.usuario_id = u.id
+      LEFT JOIN lugares l ON r.lugar_id = l.id
+      LEFT JOIN actividades a ON r.actividad_id = a.id
       WHERE r.lugar_id IN (
         SELECT id FROM lugares WHERE region_id = $1
+      )
+      OR r.actividad_id IN (
+        SELECT id FROM actividades WHERE region_id = $1
       )
       ORDER BY r.creado_en DESC
     `, [req.params.id]);
