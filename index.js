@@ -45,7 +45,7 @@ async function guardarLog(tabla, operacion, datos) {
 async function replicarANodos(endpoint, datos) {
   for (const nodo of NODOS_REPLICAS) {
     try {
-      await fetch(`${nodo}${endpoint}`, {
+      const response = await fetch(`${nodo}${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -54,9 +54,11 @@ async function replicarANodos(endpoint, datos) {
         body: JSON.stringify(datos),
         signal: AbortSignal.timeout(3000)
       });
-      console.log(`Replicado a ${nodo}${endpoint}`);
+
+      const texto = await response.text();
+      console.log(`Replicando a ${nodo}: ${response.status} - ${texto}`);
     } catch (err) {
-      console.warn(`Error replicando a ${nodo}: ${err.message}`);
+      console.error(`Error replicando a ${nodo}:`, err.message);
     }
   }
 }
@@ -67,7 +69,6 @@ async function sincronizarAlArrancar() {
   
   for (const nodo of NODOS_REPLICAS) {
     try {
-      // Obtener el timestamp del último registro en nuestro log
       const ultimoLog = await pool.query(
         `SELECT MAX(creado_en) as ultimo FROM log_replicacion WHERE nodo_origen != $1`,
         [NODO_NOMBRE]
@@ -107,9 +108,9 @@ async function aplicarCambio(cambio) {
     if (cambio.tabla === 'resenas') {
       const d = cambio.datos;
       await pool.query(
-        `INSERT INTO resenas (lugar_id, usuario_id, titulo, comentario, estrellas)
-         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
-        [d.lugar_id, d.usuario_id, d.titulo, d.comentario, d.estrellas]
+        `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [d.lugar_id, d.actividad_id, d.usuario_id, d.titulo, d.comentario, d.estrellas]
       );
     } else if (cambio.tabla === 'usuarios') {
       const d = cambio.datos;
@@ -397,7 +398,41 @@ app.post('/api/conducta', async (req, res) => {
   }
 });
 
-// ✅ RESEÑAS
+// ✅ RESEÑAS - UN SOLO ENDPOINT (fusionado)
+app.post('/api/resenas', async (req, res) => {
+  try {
+    const esReplicacion = req.headers['x-replicacion'] === 'true';
+    const { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas } = req.body;
+    
+    // Si es replicación, solo insertar
+    if (esReplicacion) {
+      await pool.query(
+        `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`,
+        [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
+      );
+      console.log(`✅ Reseña replicada para lugar ${lugar_id}`);
+      return res.json({ success: true });
+    }
+    
+    // Si NO es replicación, crear nueva reseña
+    const result = await pool.query(
+      `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
+    );
+    
+    res.json(result.rows[0]);
+
+    // Replicar a otros nodos (en segundo plano)
+    await guardarLog('resenas', 'INSERT', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
+    replicarANodos('/api/resenas', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
+    
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/resenas/region/:id', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -436,25 +471,7 @@ app.get('/api/resenas/lugar/:id', async (req, res) => {
   }
 });
 
-app.post('/api/resenas', async (req, res) => {
-  try {
-    const esReplicacion = req.headers['x-replicacion'] === 'true';
-    const { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas } = req.body;
-    const result = await pool.query(
-      `INSERT INTO resenas (lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [lugar_id, actividad_id ?? null, usuario_id, titulo, comentario, estrellas]
-    );
-    res.json(result.rows[0]);
-
-    if (!esReplicacion) {
-      await guardarLog('resenas', 'INSERT', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
-      replicarANodos('/api/resenas', { lugar_id, actividad_id, usuario_id, titulo, comentario, estrellas });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-  app.get('/api/resenas/actividad/:id', async (req, res) => {
+app.get('/api/resenas/actividad/:id', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT r.*, u.nombre_usuario, u.foto_url as usuario_foto
@@ -467,7 +484,6 @@ app.post('/api/resenas', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
 });
 
 // ✅ GUIA POR REGIÓN
@@ -500,20 +516,39 @@ app.get('/api/guia/region/:id', async (req, res) => {
   }
 });
 
-// ✅ AUTENTICACIÓN
+// ✅ AUTENTICACIÓN - UN SOLO ENDPOINT (fusionado)
 app.post('/api/auth/registro', async (req, res) => {
   try {
     const esReplicacion = req.headers['x-replicacion'] === 'true';
     const { nombre_usuario, correo, contrasena } = req.body;
 
-    if (!esReplicacion) {
+    // Si es replicación, solo insertar sin validaciones extras
+    if (esReplicacion) {
       const existe = await pool.query(
         'SELECT id FROM usuarios WHERE correo = $1 OR nombre_usuario = $2',
         [correo, nombre_usuario]
       );
-      if (existe.rows.length > 0) {
-        return res.status(400).json({ error: 'El correo o nombre de usuario ya está en uso' });
+      
+      if (existe.rows.length === 0) {
+        const hash = await bcrypt.hash(contrasena, 10);
+        await pool.query(
+          `INSERT INTO usuarios (nombre_usuario, correo, contrasena_hash)
+           VALUES ($1, $2, $3)`,
+          [nombre_usuario, correo, hash]
+        );
+        console.log(`✅ Usuario replicado: ${nombre_usuario}`);
       }
+      return res.json({ success: true });
+    }
+
+    // Si NO es replicación, es un registro normal desde el frontend
+    const existe = await pool.query(
+      'SELECT id FROM usuarios WHERE correo = $1 OR nombre_usuario = $2',
+      [correo, nombre_usuario]
+    );
+    
+    if (existe.rows.length > 0) {
+      return res.status(400).json({ error: 'El correo o nombre de usuario ya está en uso' });
     }
 
     const hash = await bcrypt.hash(contrasena, 10);
@@ -525,12 +560,14 @@ app.post('/api/auth/registro', async (req, res) => {
 
     const usuario = result.rows[0];
     const token = jwt.sign({ id: usuario.id }, JWT_SECRET, { expiresIn: '30d' });
+    
+    // Responder al cliente
     res.json({ usuario, token });
 
-    if (!esReplicacion) {
-      await guardarLog('usuarios', 'INSERT', { nombre_usuario, correo, contrasena_hash: hash });
-      replicarANodos('/api/auth/registro', { nombre_usuario, correo, contrasena });
-    }
+    // Replicar a otros nodos (en segundo plano)
+    await guardarLog('usuarios', 'INSERT', { nombre_usuario, correo, contrasena_hash: hash });
+    replicarANodos('/api/auth/registro', { nombre_usuario, correo, contrasena });
+    
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -724,6 +761,5 @@ app.get('/api/replicacion/estado', async (req, res) => {
 
 app.listen(process.env.PORT, async () => {
   console.log(`Nodo ${NODO_NOMBRE} corriendo en puerto ${process.env.PORT}`);
-  // Esperar 5 segundos para que el servidor esté listo antes de sincronizar
   setTimeout(sincronizarAlArrancar, 5000);
 });
