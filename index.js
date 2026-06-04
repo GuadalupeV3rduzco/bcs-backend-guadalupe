@@ -23,6 +23,9 @@ const pool = new Pool({
 
 const NODOS_REPLICAS = [
   'https://bcs-backend-juan-production.up.railway.app',
+  'https://bcs-backend-gama-production.up.railway.app',
+  'https://bcs-backend-adan-production.up.railway.app',
+  'https://bcs-backend-sebas-production.up.railway.app',
 ];
 
 // Guardar en log de replicación
